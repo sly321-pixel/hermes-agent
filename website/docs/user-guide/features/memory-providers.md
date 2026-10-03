@@ -436,6 +436,7 @@ The plugin authenticates with `X-API-Key` and uses the server's `/search` / `/me
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `false` | Rerank search results for relevance (platform mode only) |
 | `sync_max_chars` | `450` | Per-message character cap applied before each turn is sent for fact extraction, cut at the last sentence boundary. The default fits 512-token embedders (Ollama `bge-small-zh-v1.5`, `all-minilm`); raise it (e.g. `6000`) for 8k-token embedders such as `text-embedding-3-small`, `jina-embeddings-v3` or `bge-m3` |
+| `shutdown_wait_secs` | `5` | How long session shutdown waits for an in-flight extraction before returning. Work still running afterwards finishes and closes the backend itself, so long-lived processes (gateway, cron) lose nothing; raise it only for CLI one-shots (`hermes chat -q`), whose process exits right after shutdown |
 
 **OSS supported providers:**
 

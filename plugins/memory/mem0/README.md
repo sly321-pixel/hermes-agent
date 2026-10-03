@@ -31,6 +31,7 @@ Behavioral settings live in `$HERMES_HOME/mem0.json` (set them via `hermes memor
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `false` | Rerank search results for relevance (platform mode only) |
 | `sync_max_chars` | `450` | Per-message character cap applied before each turn is sent for fact extraction (cut at the last sentence boundary). Default fits 512-token embedders; raise it (e.g. `6000`) for 8k-token embedders such as `text-embedding-3-small`, `jina-embeddings-v3`, `bge-m3` |
+| `shutdown_wait_secs` | `5` | How long session shutdown waits for an in-flight extraction before returning. Work still running afterwards finishes and closes the backend itself, so long-lived processes (gateway, cron) lose nothing; raise it only for CLI one-shots (`hermes chat -q`), whose process exits right after shutdown |
 
 The plugin has three connection modes:
 

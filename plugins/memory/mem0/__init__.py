@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # Circuit breaker: after _BREAKER_THRESHOLD consecutive failures, pause API
 # calls for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
 _BREAKER_THRESHOLD, _BREAKER_COOLDOWN_SECS, _PREFETCH_WAIT_SECS = 5, 120, 3
+# How long shutdown() lets in-flight work finish while the caller waits. Work still running after it
+# keeps the backend open and closes it itself (see _BackendLease), so this only matters to callers whose
+# process exits right after shutdown (CLI one-shots). Kept short: cron teardown is capped at 10s total.
+# ``shutdown_wait_secs`` in mem0.json overrides it.
+_SHUTDOWN_WAIT_SECS = 5.0
 _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError")
 # Placeholder user_id. initialize() treats it as "no operator-configured user_id"
 # so legacy mem0.json files written by the wizard don't override gateway-native ids.
@@ -65,6 +70,57 @@ def _truncate_for_sync(text: str, max_len: int = _SYNC_MSG_MAX_CHARS) -> str:
     if cut > max_len // 3:
         return text[:cut + 1]
     return text[:max_len]
+
+
+class _BackendLease:
+    """A backend plus a count of the operations still using it.
+
+    OSS ``add(..., infer=True)`` with a local LLM can outlive any reasonable shutdown wait (minutes), and
+    closing mem0's ``Memory`` underneath it nulls ``self.db`` mid-call: the vector inserts and
+    ``save_messages`` then fail and the turn's extracted memories are lost (#90728, #107517).
+    ``retire()`` therefore refuses new work and closes right away only when idle; otherwise the last
+    ``release()`` closes. Exactly one close either way.
+    """
+
+    def __init__(self, backend):
+        self.backend = backend
+        self._lock = threading.Lock()
+        self._inflight, self._retired, self._closed = 0, False, False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def acquire(self):
+        """The backend for one operation, or None once retired. Pair every non-None result with release()."""
+        with self._lock:
+            if self._retired:
+                return None
+            self._inflight += 1
+            return self.backend
+
+    def release(self) -> None:
+        with self._lock:
+            self._inflight -= 1
+            close = self._retired and self._inflight == 0 and not self._closed
+            self._closed = self._closed or close
+        if close:
+            self._close()
+
+    def retire(self) -> int:
+        """Stop accepting work; close now if idle. Returns how many operations are still running."""
+        with self._lock:
+            self._retired = True
+            busy = self._inflight
+            close = busy == 0 and not self._closed
+            self._closed = self._closed or close
+        if close:
+            self._close()
+        return busy
+
+    def _close(self) -> None:
+        with suppress(Exception):
+            self.backend.close()
 
 
 def _is_client_error(exc: Exception) -> bool:
@@ -127,10 +183,10 @@ class Mem0MemoryProvider(MemoryProvider):
     """Mem0 memory with server-side extraction and semantic search (platform, self-hosted or OSS)."""
 
     def __init__(self):
-        self._config = self._backend = self._sync_thread = self._prefetch_thread = None
+        self._config = self._lease = self._sync_thread = self._prefetch_thread = None
         self._mode, self._api_key, self._host, self._user_id, self._agent_id = "platform", "", "", _DEFAULT_USER_ID, "hermes"
         self._rerank_default, self._channel = False, "cli"  # channel = gateway name (cli/telegram/discord/...)
-        self._sync_max_chars = _SYNC_MSG_MAX_CHARS
+        self._sync_max_chars, self._shutdown_wait = _SYNC_MSG_MAX_CHARS, _SHUTDOWN_WAIT_SECS
         self._prefetch_query = self._prefetch_result = ""
         self._prefetch_done = self._atexit_registered = False
         self._consecutive_failures, self._breaker_open_until = 0, 0.0  # circuit breaker state
@@ -139,6 +195,23 @@ class Mem0MemoryProvider(MemoryProvider):
     @property
     def name(self) -> str:
         return "mem0"
+
+    @property
+    def _backend(self):
+        """The live backend; None before initialize() and once it has been closed. Retired-but-open
+        stays visible so operations already holding a lease keep working until they finish."""
+        lease = self._lease
+        return lease.backend if lease is not None and not lease.closed else None
+
+    @_backend.setter
+    def _backend(self, backend) -> None:
+        self._lease = _BackendLease(backend) if backend is not None else None
+
+    def _acquire(self):
+        """(lease, backend) for one operation, or (None, None) when uninitialized or shutting down."""
+        lease = self._lease
+        backend = lease.acquire() if lease is not None else None
+        return (lease, backend) if backend is not None else (None, None)
 
     def is_available(self) -> bool:
         cfg = _load_config()
@@ -236,7 +309,11 @@ class Mem0MemoryProvider(MemoryProvider):
         self._rerank_default = _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
         self._channel = kwargs.get("platform") or "cli"
         self._sync_max_chars = int(cfg.get("sync_max_chars") or _SYNC_MSG_MAX_CHARS)
-        self._backend = self._create_backend()
+        try:
+            self._shutdown_wait = max(0.0, float(cfg.get("shutdown_wait_secs", _SHUTDOWN_WAIT_SECS)))
+        except (TypeError, ValueError):
+            self._shutdown_wait = _SHUTDOWN_WAIT_SECS
+        self._backend = self._create_backend()  # a fresh lease: re-init after shutdown accepts work again
         if self._backend and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
             self._atexit_registered = True
@@ -246,9 +323,9 @@ class Mem0MemoryProvider(MemoryProvider):
         # principal; writes attach agent_id and metadata.channel so narrower views remain possible at query time.
         return (backend or self._backend).search(query, filters={"user_id": self._user_id}, top_k=top_k, rerank=rerank)
 
-    def _add(self, messages: list, infer: bool):
+    def _add(self, messages: list, infer: bool, backend=None):
         metadata = {"channel": self._channel} if self._channel else {}
-        return self._backend.add(messages, user_id=self._user_id, agent_id=self._agent_id, infer=infer, metadata=metadata)
+        return (backend or self._backend).add(messages, user_id=self._user_id, agent_id=self._agent_id, infer=infer, metadata=metadata)
 
     def system_prompt_block(self) -> str:
         # Mirror _create_backend precedence (oss > host > platform). Rerank is a Mem0 Platform feature only.
@@ -268,12 +345,14 @@ class Mem0MemoryProvider(MemoryProvider):
             return result
 
     def _start_prefetch(self, query: str) -> None:
-        backend = self._backend
-        if not query or backend is None or self._is_breaker_open():
+        if not query or self._backend is None or self._is_breaker_open():
             return
 
-        def _run():
-            results = self._try(lambda: self._search(query, backend=backend), logger.debug, "Mem0 prefetch failed: %s")
+        def _run(lease, backend):
+            try:
+                results = self._try(lambda: self._search(query, backend=backend), logger.debug, "Mem0 prefetch failed: %s")
+            finally:
+                lease.release()
             lines = [r.get("memory", "") for r in (results or []) if r.get("memory")]
             body = "## Mem0 Memory\n" + "\n".join(f"- {l}" for l in lines) if lines else ""
             with self._prefetch_lock:
@@ -284,9 +363,16 @@ class Mem0MemoryProvider(MemoryProvider):
             # Same query already answered or still in flight: don't restart it.
             if self._prefetch_query == query and (self._prefetch_done or (self._prefetch_thread and self._prefetch_thread.is_alive())):
                 return
+            lease, backend = self._acquire()
+            if backend is None:  # shutting down
+                return
             self._prefetch_query, self._prefetch_result, self._prefetch_done = query, "", False
-            self._prefetch_thread = t = spawn_context_thread(_run, name="mem0-prefetch")
-        t.start()
+            self._prefetch_thread = t = spawn_context_thread(_run, name="mem0-prefetch", args=(lease, backend))
+        try:
+            t.start()
+        except Exception:
+            lease.release()
+            raise
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall memories for the CURRENT question with a short hot-path wait."""
@@ -304,22 +390,34 @@ class Mem0MemoryProvider(MemoryProvider):
         if self._backend is None or self._is_breaker_open():
             return
 
-        def _sync():
-            if self._backend is not None:
-                messages = [
-                    {"role": "user", "content": _truncate_for_sync(user_content, self._sync_max_chars)},
-                    {"role": "assistant", "content": _truncate_for_sync(assistant_content, self._sync_max_chars)},
-                ]
-                self._try(lambda: self._add(messages, infer=True), logger.warning, "Mem0 sync failed: %s")
+        def _sync(lease, backend):
+            messages = [
+                {"role": "user", "content": _truncate_for_sync(user_content, self._sync_max_chars)},
+                {"role": "assistant", "content": _truncate_for_sync(assistant_content, self._sync_max_chars)},
+            ]
+            try:
+                self._try(lambda: self._add(messages, infer=True, backend=backend), logger.warning, "Mem0 sync failed: %s")
+            finally:
+                lease.release()  # the last in-flight operation of a retired lease closes the backend
 
         with self._sync_lock:
+            # Leased before anything else: shutting down refuses at once (no 5s wait on the previous
+            # turn), and a shutdown racing the spawn below defers its close until this sync finishes.
+            lease, backend = self._acquire()
+            if backend is None:
+                return
             prev = self._sync_thread
             if prev and prev.is_alive():
                 prev.join(timeout=5.0)
                 if prev.is_alive():  # still busy after the wait: skip to avoid duplicate ingestion
+                    lease.release()
                     return
-            self._sync_thread = spawn_context_thread(_sync, name="mem0-sync")
-            self._sync_thread.start()
+            self._sync_thread = t = spawn_context_thread(_sync, name="mem0-sync", args=(lease, backend))
+            try:
+                t.start()
+            except Exception:
+                lease.release()
+                raise
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return list(TOOL_SCHEMAS)
@@ -353,9 +451,18 @@ class Mem0MemoryProvider(MemoryProvider):
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
-        if self._backend is None:
+        lease, backend = self._acquire()  # held for the call: a concurrent shutdown defers its close
+        if backend is None:
+            if self._lease is not None:
+                return json.dumps({"error": "Mem0 is shutting down for this session."})
             err = getattr(self, "_init_error", "unknown error")
             return json.dumps({"error": f"Mem0 backend not initialized: {err}.{self._oss_hint(' Check that {vs} is running and reachable.')}"})
+        try:
+            return self._handle_tool_call(tool_name, args)
+        finally:
+            lease.release()
+
+    def _handle_tool_call(self, tool_name: str, args: dict) -> str:
         if self._is_breaker_open():
             return json.dumps({"error": f"Mem0 temporarily unavailable (multiple consecutive failures). Will retry automatically.{self._oss_hint(' Check that your {vs} is running.')}"})
         if tool_name not in self._TOOL_HANDLERS:
@@ -375,17 +482,27 @@ class Mem0MemoryProvider(MemoryProvider):
         self._record_success()
         return result
 
-    def _shutdown_backend(self):
-        with suppress(Exception):
-            if self._backend:
-                self._backend.close()
-                self._backend = None
+    def _shutdown_backend(self) -> None:
+        """atexit hook. Daemon workers are still alive here and die with the interpreter, so retire
+        (close only if idle) rather than close underneath them — and say what is being dropped."""
+        busy = self._lease.retire() if self._lease is not None else 0
+        if busy:
+            logger.warning("Mem0: process exiting with %d memory operation(s) still running; their writes are lost "
+                           "(raise shutdown_wait_secs in mem0.json to wait longer).", busy)
 
     def shutdown(self) -> None:
+        lease = self._lease
+        if lease is None:
+            return
+        lease.retire()  # refuse new work first; closes right here when idle
+        deadline = time.monotonic() + self._shutdown_wait
         for t in (self._prefetch_thread, self._sync_thread):
-            if t and t.is_alive():
-                t.join(timeout=5.0)
-        self._shutdown_backend()
+            if t and t.is_alive() and t is not threading.current_thread():
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
+        if busy := lease.retire():
+            # Normal in a long-lived gateway (cron, session eviction): the worker closes the backend itself.
+            logger.info("Mem0: %d memory operation(s) still running after %.1fs; the backend closes when they finish.",
+                        busy, self._shutdown_wait)
 
 
 def register(ctx) -> None:
